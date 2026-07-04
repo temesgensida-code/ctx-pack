@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+#
+# ctx-pack — LLM context packer
+#
+# Bash layer responsibilities (deliberately kept "dumb and fast"):
+#   1. Parse CLI args
+#   2. Resolve the target directory + find all .gitignore files in it
+#   3. Build a traversal exclusion list (gitignore patterns + user --exclude)
+#   4. Walk the tree with `find`, filter it, and stream the resulting file
+#      list to the Python engine over stdin (NUL-delimited, so we survive
+#      spaces / unicode / weird filenames without breaking).
+#
+# All "smart" work (token counting, secret scanning, markdown generation,
+# async I/O) lives in src/pack_engine.py. Bash never opens a source file
+# itself — it only ever decides *which* files are candidates.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Resolve paths relative to this script, so `ctx-pack` works no matter where
+# it's invoked from (once symlinked onto PATH).
+# ---------------------------------------------------------------------------
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$DIR/$SCRIPT_SOURCE"
+done
+BIN_DIR="$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)"
+PROJECT_ROOT="$(dirname "$BIN_DIR")"
+ENGINE="$PROJECT_ROOT/src/pack_engine.py"
+
+# ---------------------------------------------------------------------------
+# ANSI color codes for professional terminal UX
+# ---------------------------------------------------------------------------
+readonly C_RESET='\033[0m'
+readonly C_BOLD='\033[1m'
+readonly C_DIM='\033[2m'
+readonly C_RED='\033[31m'
+readonly C_GREEN='\033[32m'
+readonly C_YELLOW='\033[33m'
+readonly C_BLUE='\033[34m'
+readonly C_CYAN='\033[36m'
+readonly C_MAGENTA='\033[35m'
+
+log_info()  { echo -e "${C_CYAN}[ctx-pack]${C_RESET} $*" >&2; }
+log_ok()    { echo -e "${C_GREEN}[ctx-pack]${C_RESET} $*" >&2; }
+log_warn()  { echo -e "${C_YELLOW}[ctx-pack][warn]${C_RESET} $*" >&2; }
+log_err()   { echo -e "${C_RED}[ctx-pack][error]${C_RESET} $*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+TARGET_DIR="."
+OUTPUT_FILE="ctx-pack.md"
+TOKEN_BUDGET=0            # 0 == unlimited
+USER_EXCLUDES=()          # extra glob patterns via --exclude (repeatable)
+RESPECT_GITIGNORE=1
+INCLUDE_HIDDEN=0
+VERBOSE=0
+
+usage() {
+  cat <<EOF
+${C_BOLD}ctx-pack${C_RESET} — pack a codebase into a single LLM-optimized Markdown file
+
+${C_BOLD}USAGE${C_RESET}
+  ctx-pack [OPTIONS]
+
+${C_BOLD}OPTIONS${C_RESET}
+  -d, --dir DIR         Target directory to scan          (default: .)
+  -o, --output FILE     Output markdown file               (default: ctx-pack.md)
+  -b, --budget N        Token budget (e.g. 30000). 0 = unlimited (default: 0)
+      --exclude GLOB    Additional exclude pattern (repeatable)
+      --no-gitignore    Do not honor .gitignore files
+      --include-hidden  Include dotfiles/dotdirs (still filtered by excludes)
+  -v, --verbose         Verbose logging
+  -h, --help            Show this help
+
+${C_BOLD}EXAMPLES${C_RESET}
+  ctx-pack -d ./src -o context.md -b 30000
+  ctx-pack --exclude "*.lock" --exclude "dist/*" -b 50000
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Arg parsing
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dir)
+      TARGET_DIR="${2:?--dir requires an argument}"; shift 2 ;;
+    -o|--output)
+      OUTPUT_FILE="${2:?--output requires an argument}"; shift 2 ;;
+    -b|--budget)
+      TOKEN_BUDGET="${2:?--budget requires an argument}"; shift 2 ;;
+    --exclude)
+      USER_EXCLUDES+=("${2:?--exclude requires an argument}"); shift 2 ;;
+    --no-gitignore)
+      RESPECT_GITIGNORE=0; shift ;;
+    --include-hidden)
+      INCLUDE_HIDDEN=1; shift ;;
+    -v|--verbose)
+      VERBOSE=1; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      log_err "Unknown argument: $1"
+      usage
+      exit 1 ;;
+  esac
+done
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+  log_err "Directory not found: $TARGET_DIR"
+  exit 1
+fi
+
+if [[ ! -f "$ENGINE" ]]; then
+  log_err "Python engine not found at $ENGINE"
+  exit 1
+fi
+
+PYTHON_BIN="$(command -v python3 || true)"
+if [[ -z "$PYTHON_BIN" ]]; then
+  log_err "python3 is required but was not found on PATH"
+  exit 1
+fi
+
+TARGET_DIR="$(cd "$TARGET_DIR" && pwd)"
+log_info "Target directory: ${C_BOLD}${TARGET_DIR}${C_RESET}"
+
+# ---------------------------------------------------------------------------
+# Baseline exclusions — the stuff nobody ever wants shipped to an LLM prompt
+# ---------------------------------------------------------------------------
+BASE_EXCLUDES=(
+  ".git/*" "*/.git/*"
+  "node_modules/*" "*/node_modules/*"
+  "__pycache__/*" "*/__pycache__/*"
+  "*.pyc" "*.pyo"
+  ".venv/*" "*/.venv/*" "venv/*" "*/venv/*"
+  "dist/*" "build/*" "*.egg-info/*"
+  "*.min.js" "*.min.css"
+  "*.lock"
+  ".DS_Store"
+  "*.png" "*.jpg" "*.jpeg" "*.gif" "*.ico" "*.pdf" "*.zip" "*.tar" "*.gz"
+  "*.woff" "*.woff2" "*.ttf" "*.eot"
+  "*.sqlite" "*.db"
+)
+
+# ---------------------------------------------------------------------------
+# Ingest .gitignore files under the target directory and translate their
+# patterns into `find -path` friendly globs. This is intentionally a
+# pragmatic subset of gitignore semantics (no negation, no !-rules) — good
+# enough to keep noise out, not a full git implementation.
+# ---------------------------------------------------------------------------
+GITIGNORE_EXCLUDES=()
+if [[ "$RESPECT_GITIGNORE" -eq 1 ]]; then
+  while IFS= read -r -d '' gi_file; do
+    gi_dir="$(dirname "$gi_file")"
+    [[ "$VERBOSE" -eq 1 ]] && log_info "Reading $gi_file"
+    while IFS= read -r line; do
+      # strip comments / blank lines / negations (unsupported subset)
+      line="${line%%#*}"
+      line="$(echo "$line" | sed 's/[[:space:]]*$//')"
+      [[ -z "$line" ]] && continue
+      [[ "$line" == \!* ]] && continue
+
+      # normalize: drop leading slash (anchored to gi_dir), drop trailing slash
+      pattern="${line#/}"
+      pattern="${pattern%/}"
+
+      if [[ "$pattern" == */* || "$line" == /* ]]; then
+        GITIGNORE_EXCLUDES+=("${gi_dir}/${pattern}" "${gi_dir}/${pattern}/*")
+      else
+        GITIGNORE_EXCLUDES+=("*/${pattern}" "*/${pattern}/*" "${pattern}" "${pattern}/*")
+      fi
+    done < "$gi_file"
+  done < <(find "$TARGET_DIR" -type f -name ".gitignore" -print0)
+  log_info "Loaded ${#GITIGNORE_EXCLUDES[@]} pattern(s) from .gitignore file(s)"
+fi
+
+ALL_EXCLUDES=("${BASE_EXCLUDES[@]}" "${GITIGNORE_EXCLUDES[@]}" "${USER_EXCLUDES[@]}")
+
+# ---------------------------------------------------------------------------
+# Build the `find` prune/exclude expression dynamically
+# ---------------------------------------------------------------------------
+FIND_ARGS=("$TARGET_DIR" "-type" "f")
+
+if [[ "$INCLUDE_HIDDEN" -eq 0 ]]; then
+  FIND_ARGS+=( "-not" "-path" "*/.*" )
+fi
+
+for pattern in "${ALL_EXCLUDES[@]}"; do
+  FIND_ARGS+=( "-not" "-path" "*${pattern}" )
+done
+
+log_info "Scanning filesystem..."
+mapfile -d '' -t CANDIDATE_FILES < <(find "${FIND_ARGS[@]}" -print0 2>/dev/null | sort -z)
+
+FILE_COUNT="${#CANDIDATE_FILES[@]}"
+if [[ "$FILE_COUNT" -eq 0 ]]; then
+  log_warn "No files matched after filtering. Nothing to pack."
+  exit 0
+fi
+
+log_ok "Found ${C_BOLD}${FILE_COUNT}${C_RESET} candidate file(s). Handing off to the Python engine..."
+
+# ---------------------------------------------------------------------------
+# Stream NUL-delimited paths to the Python engine on stdin. Python owns
+# everything downstream: reading, token counting, secret scanning, ranking,
+# and markdown rendering.
+# ---------------------------------------------------------------------------
+printf '%s\0' "${CANDIDATE_FILES[@]}" | "$PYTHON_BIN" "$ENGINE" \
+  --root "$TARGET_DIR" \
+  --output "$OUTPUT_FILE" \
+  --budget "$TOKEN_BUDGET" \
+  $([[ "$VERBOSE" -eq 1 ]] && echo "--verbose")
+
+STATUS=$?
+if [[ $STATUS -eq 0 ]]; then
+  log_ok "Context pack written to ${C_BOLD}${OUTPUT_FILE}${C_RESET}"
+else
+  log_err "Python engine exited with status $STATUS"
+fi
+exit $STATUS

@@ -5,19 +5,6 @@ audits for secrets, token-counts everything, and packs it into a single
 LLM-optimized Markdown file — so you stop hand-picking files or blowing past
 context limits when working with Claude/ChatGPT on a real repo.
 
-## Architecture
-
-```
-ctx-pack/
-├── bin/
-│   └── ctx-pack          # Bash entry point: args, .gitignore ingestion, file discovery
-├── src/
-│   ├── pack_engine.py     # Python async engine: read, secret-scan, token-count, rank, render
-│   └── requirements.txt
-├── tests/                 # (next step: pytest suite)
-├── docs/
-└── README.md
-```
 
 **Separation of concerns:**
 - **Bash** owns everything OS-level and cheap: argument parsing, `.gitignore`
@@ -81,10 +68,14 @@ When a budget is set, files are greedily packed in priority order
 anything that doesn't fit is listed in an "Omitted Due to Token Budget"
 table rather than silently vanishing.
 
-## Roadmap (round two)
+## Roadmap (round two)---this is work to do,if you have interest in adding belows functionalities feel free to clone and play with it
 
 - [ ] pytest suite covering secret patterns, binary detection, budget edge cases
 - [ ] Configurable priority rules via `.ctxpackrc`
 - [ ] `rich`-based progress/summary UI
 - [ ] Import-graph-aware ranking (pull in a file's direct dependencies first)
 - [ ] `--stdin-only` mode for piping arbitrary file lists (e.g. from `git diff --name-only`)
+
+
+#### if you want to detailed explanation of how it works and how to use it, click belows link
+[GOOGLE DRIVE](https://drive.google.com/file/d/12Jo9mIFITLlfheCk4ZSa4jYvx8PinLqv/view?usp=sharing)
